@@ -90,6 +90,7 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 LARGE_UPLOAD_EXTRACT_MB = int(os.getenv(“LARGE_UPLOAD_EXTRACT_MB”, “300”))
 LARGE_UPLOAD_EXTRACT_BYTES = LARGE_UPLOAD_EXTRACT_MB * 1024 * 1024
 MAX_CONCURRENT_SUMMARIES = max(1, int(os.getenv(“MAX_CONCURRENT_SUMMARIES”, “3”)))
+MAX_CONCURRENT_TASKS = max(1, int(os.getenv(“MAX_CONCURRENT_TASKS”, “3”)))
 TASK_HISTORY_LIMIT = max(10, int(os.getenv(“TASK_HISTORY_LIMIT”, “100”)))
 ALLOWED_MEDIA_SUFFIXES = {
     ".mp3",
@@ -259,6 +260,7 @@ batch_store = BatchStore(WORKSPACE_DIR)
 tasks: dict[str, dict[str, Any]] = {}
 running_jobs: dict[str, asyncio.Task[None]] = {}
 summary_slots = asyncio.Semaphore(MAX_CONCURRENT_SUMMARIES)
+task_slots = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
 class BilibiliCookie(BaseModel):
