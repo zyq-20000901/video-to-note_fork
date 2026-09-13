@@ -3085,16 +3085,19 @@ async function startBatch() {
         return;
     }
 
+    // 构造符合1.4.0 API格式的payload
     const payload = {
-        urls: lines,
-        llm_profile: profile.value,
-        api_key: keyValue,
-        whisper_model: byId('whisperModel')?.value || 'large-v3',
-        format: byId('formatSelect')?.value || 'markdown',
-        language: byId('languageCode')?.value || 'zh',
-        output_mode: byId('outputSegmented')?.checked ? 'segmented' : 'full',
-        temperature: parseFloat(byId('temperature')?.value || 0),
-        speaker_label: byId('speakerLabel')?.checked || false
+        items: lines.map(url => ({ url })),
+        config: {
+            llm_profile: profile.value,
+            api_key: keyValue,
+            whisper_model: byId('whisperModel')?.value || 'large-v3',
+            format: byId('formatSelect')?.value || 'markdown',
+            language: byId('languageCode')?.value || 'zh',
+            output_mode: byId('outputSegmented')?.checked ? 'segmented' : 'full',
+            temperature: parseFloat(byId('temperature')?.value || 0),
+            speaker_label: byId('speakerLabel')?.checked || false
+        }
     };
 
     try {
@@ -3125,8 +3128,13 @@ async function startBatch() {
 }
 
 async function refreshBatch(showMessage = false) {
+    if (!currentBatchId) {
+        if (showMessage) showToast('没有活动的批量任务', 'info');
+        return;
+    }
+
     try {
-        const response = await fetch('/api/batches');
+        const response = await fetch(`/api/batches/${currentBatchId}`);
         if (!response.ok) {
             const errMsg = await extractErrorMessage(response, '获取批量状态失败');
             if (showMessage) showToast(errMsg, 'error');
@@ -3168,19 +3176,22 @@ function renderBatchItems(items) {
         return;
     }
 
-    container.innerHTML = items.map(item => {
+    container.innerHTML = items.map((item, index) => {
         const statusClass = item.status === 'completed' ? 'success'
-            : item.status === 'failed' ? 'error'
+            : item.status === 'failed' || item.status === 'error' ? 'error'
             : item.status === 'processing' ? 'processing'
             : 'pending';
 
         const statusText = item.status === 'completed' ? '完成'
-            : item.status === 'failed' ? '失败'
+            : item.status === 'failed' || item.status === 'error' ? '失败'
             : item.status === 'processing' ? '处理中'
             : '等待中';
 
-        const retryBtn = item.status === 'failed'
-            ? `<button class="batch-retry-btn" data-batch-id="${item.batch_id}" data-item-index="${item.index}">重试</button>`
+        // 从source对象中获取URL
+        const url = item.source?.url || item.url || '未知来源';
+
+        const retryBtn = (item.status === 'failed' || item.status === 'error')
+            ? `<button class="batch-retry-btn" data-task-id="${item.task_id}">重试</button>`
             : '';
 
         const openBtn = item.status === 'completed' && item.task_id
@@ -3191,8 +3202,9 @@ function renderBatchItems(items) {
             <div class="batch-item ${statusClass}">
                 <div class="batch-item-header">
                     <span class="batch-item-status">${statusText}</span>
-                    <span class="batch-item-url" title="${item.url}">${truncateUrl(item.url)}</span>
+                    <span class="batch-item-url" title="${url}">${truncateUrl(url)}</span>
                 </div>
+                ${item.step_name ? `<div class="batch-item-step">${item.step_name}</div>` : ''}
                 ${item.error ? `<div class="batch-item-error">${item.error}</div>` : ''}
                 ${retryBtn || openBtn ? `<div class="batch-item-actions">${retryBtn}${openBtn}</div>` : ''}
             </div>
@@ -3208,9 +3220,8 @@ function truncateUrl(url, maxLen = 50) {
 function handleBatchAction(event) {
     const retryBtn = event.target.closest('.batch-retry-btn');
     if (retryBtn) {
-        const batchId = retryBtn.dataset.batchId;
-        const itemIndex = parseInt(retryBtn.dataset.itemIndex, 10);
-        retryBatchItem(batchId, itemIndex);
+        const taskId = retryBtn.dataset.taskId;
+        retryBatchItem(taskId);
         return;
     }
 
@@ -3222,10 +3233,17 @@ function handleBatchAction(event) {
     }
 }
 
-async function retryBatchItem(batchId, itemIndex) {
+async function retryBatchItem(taskId) {
+    if (!currentBatchId) {
+        showToast('批次ID丢失', 'error');
+        return;
+    }
+
     try {
-        const response = await fetch(`/api/batches/${batchId}/retry/${itemIndex}`, {
-            method: 'POST'
+        const response = await fetch(`/api/batches/${currentBatchId}/retry`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_id: taskId })
         });
 
         if (!response.ok) {
