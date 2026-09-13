@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - feat/merge-batch-and-ci-from-1.3.5
+      - optimize-parallel-and-build
   workflow_dispatch:
+    inputs:
+      branch:
+        description: '构建的分支名称'
+        required: false
+        default: 'main'
 
 permissions:
   contents: read
