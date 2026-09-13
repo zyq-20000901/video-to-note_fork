@@ -124,6 +124,10 @@ let isSubmitting = false;
 let isTaskActive = false;
 let isDownloading = false;
 let isCancelling = false;
+// 批量处理相关状态
+let currentBatch = null;
+let batchPollTimer = null;
+let batchRequestVersion = 0;
 // 结果区当前展示的是字幕稿还是笔记：标题、按钮文案与进度步数都跟着它走
 let isTranscriptTask = false;
 let elapsedTimer = null;
@@ -132,6 +136,13 @@ let elapsedSyncedAt = 0;
 let prefs = defaultPrefs();
 let persistTimer = null;
 let persistJob = null;
+
+// 批量处理相关常量
+const ACTIVE_TASK_STATUSES = ['pending', 'queued', 'processing', 'cancelling'];
+const RETRYABLE_TASK_STATUSES = ['failed', 'cancelled'];
+const FINISHED_BATCH_STATUSES = ['completed', 'failed', 'cancelled', 'rejected', 'duplicate', 'upload_failed', 'submit_failed'];
+const DELETABLE_TASK_STATUSES = ['failed', 'cancelled', 'uploaded'];
+const MAX_BATCH_ITEMS = 30;
 
 document.addEventListener('DOMContentLoaded', () => {
     window.__videoToNoReady = false;
@@ -208,6 +219,15 @@ function bindEvents() {
     bindListener('llmProfile', 'change', handleProfileChange);
     bindListener('llmProfile', 'change', updateRenameVisibility);
     bindListener('renameProfileBtn', 'click', handleProfileRenameClick);
+
+    // 批量处理事件
+    bindListener('startBatchBtn', 'click', startBatch);
+    bindListener('refreshBatchBtn', 'click', () => refreshBatch());
+    const batchItemList = byId('batchItemList');
+    if (batchItemList) {
+        batchItemList.addEventListener('click', handleBatchAction);
+    }
+
     bindListener('llmModel', 'change', handleModelChange);
     bindListener('llmTestBtn', 'click', testLlmConnection);
     bindListener('saveKeyBtn', 'click', saveApiKey);
@@ -457,6 +477,227 @@ async function openRecentTask(taskId) {
         loadRecentTasks(true);
     }
 }
+
+// ========== 批量处理相关函数 ==========
+
+function batchInputLabel(item) {
+    if (item.source_type === 'local') return item.filename || '本地文件';
+    if (!item.source_url) return '(未设置)';
+    const url = item.source_url;
+    return url.length > 50 ? url.slice(0, 47) + '...' : url;
+}
+
+function renderBatch() {
+    const list = byId('batchItemList');
+    if (!list) return;
+    if (!currentBatch || !Array.isArray(currentBatch.items) || !currentBatch.items.length) {
+        list.innerHTML = '<div class="batch-empty">暂无批量任务</div>';
+        return;
+    }
+    list.innerHTML = currentBatch.items.map((item, index) => renderBatchItem(item, index)).join('');
+}
+
+function renderBatchItem(item, index) {
+    const status = item.status || 'waiting_upload';
+    const label = batchInputLabel(item);
+    const errorMsg = item.error ? `<div class="batch-item-error">${escapeHtml(item.error)}</div>` : '';
+    return `
+        <div class="batch-item batch-item--${status}" data-index="${index}">
+            <div class="batch-item-header">
+                <span class="batch-item-number">${index + 1}</span>
+                <span class="batch-item-label">${escapeHtml(label)}</span>
+                <span class="batch-item-status">${TASK_STATUS_LABELS[status] || status}</span>
+            </div>
+            ${errorMsg}
+            ${renderBatchActions(item, index)}
+        </div>
+    `;
+}
+
+function renderBatchActions(item, index) {
+    const status = item.status || 'waiting_upload';
+    const actions = [];
+    if (RETRYABLE_TASK_STATUSES.includes(status)) {
+        actions.push(`<button class="batch-action-btn" data-action="retry" data-index="${index}">重试</button>`);
+    }
+    if (DELETABLE_TASK_STATUSES.includes(status) || status === 'waiting_upload') {
+        actions.push(`<button class="batch-action-btn batch-action-btn--danger" data-action="delete" data-index="${index}">删除</button>`);
+    }
+    if (!actions.length) return '';
+    return `<div class="batch-item-actions">${actions.join('')}</div>`;
+}
+
+function handleBatchAction(event) {
+    const btn = event.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const index = parseInt(btn.dataset.index, 10);
+    if (action === 'retry') retryBatchItem(index);
+    if (action === 'delete') deleteBatchItem(index);
+}
+
+function applyBatchSnapshot(snapshot) {
+    if (!snapshot || !snapshot.batch_id) {
+        currentBatch = null;
+        renderBatch();
+        return;
+    }
+    currentBatch = snapshot;
+    renderBatch();
+    const hasActive = snapshot.items.some(item => ACTIVE_TASK_STATUSES.includes(item.status));
+    if (hasActive && !batchPollTimer) {
+        scheduleBatchPoll(POLL_DELAY_MS);
+    }
+}
+
+function rememberBatch() {
+    if (!currentBatch || !currentBatch.batch_id) {
+        sessionStorage.removeItem('lastBatchId');
+        return;
+    }
+    sessionStorage.setItem('lastBatchId', currentBatch.batch_id);
+}
+
+async function restoreLastBatch() {
+    const batchId = sessionStorage.getItem('lastBatchId');
+    if (!batchId) return;
+    await refreshBatch(batchId);
+}
+
+function stopBatchPolling() {
+    if (batchPollTimer) clearTimeout(batchPollTimer);
+    batchPollTimer = null;
+}
+
+function scheduleBatchPoll(delay = POLL_DELAY_MS) {
+    stopBatchPolling();
+    batchPollTimer = setTimeout(() => refreshBatch(), delay);
+}
+
+async function refreshBatch(batchId = null) {
+    const targetId = batchId || currentBatch?.batch_id;
+    if (!targetId) return;
+    try {
+        const response = await fetch(`${API_BASE}/batches/${encodeURIComponent(targetId)}`, {
+            cache: 'no-store'
+        });
+        if (!response.ok) {
+            if (response.status === 404) {
+                currentBatch = null;
+                renderBatch();
+                sessionStorage.removeItem('lastBatchId');
+                return;
+            }
+            throw new Error(`${response.status} ${response.statusText}`);
+        }
+        const snapshot = await response.json();
+        applyBatchSnapshot(snapshot);
+        rememberBatch();
+        const hasActive = snapshot.items.some(item => ACTIVE_TASK_STATUSES.includes(item.status));
+        if (hasActive) scheduleBatchPoll();
+    } catch (error) {
+        console.error('[批量] 刷新失败:', error);
+    }
+}
+
+async function startBatch() {
+    const files = byId('localFile')?.files;
+    const sourceType = byId('sourceType')?.value;
+    if (sourceType === 'local' && (!files || !files.length)) {
+        showToast('请先选择本地文件', 'error');
+        return;
+    }
+    if (sourceType === 'url') {
+        showToast('批量处理仅支持本地文件', 'error');
+        return;
+    }
+    if (files.length > MAX_BATCH_ITEMS) {
+        showToast(`最多支持 ${MAX_BATCH_ITEMS} 个文件`, 'error');
+        return;
+    }
+    const config = collectTaskConfig();
+    try {
+        showToast('正在上传文件...', 'info');
+        const items = await uploadBatchFiles(files, config);
+        showToast('正在提交批量任务...', 'info');
+        const snapshot = await submitBatch(items, config);
+        applyBatchSnapshot(snapshot);
+        rememberBatch();
+        showToast(`已提交 ${items.length} 个任务`, 'success');
+        loadRecentTasks(true);
+        const hasActive = snapshot.items.some(item => ACTIVE_TASK_STATUSES.includes(item.status));
+        if (hasActive) scheduleBatchPoll();
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function uploadBatchFiles(files, config) {
+    const items = [];
+    for (const file of files) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+        const data = await readResponse(response, `上传 ${file.name} 失败`);
+        items.push({
+            source_type: 'local',
+            filename: file.name,
+            uploaded_filename: data.uploaded_filename,
+            status: 'uploaded'
+        });
+    }
+    return items;
+}
+
+async function submitBatch(items, config) {
+    const response = await fetch(`${API_BASE}/batches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items, config })
+    });
+    return await readResponse(response, '提交批量任务失败');
+}
+
+async function retryBatchItem(index, options = {}) {
+    if (!currentBatch?.batch_id) return;
+    const item = currentBatch.items[index];
+    if (!item) return;
+    try {
+        const response = await fetch(`${API_BASE}/batches/${currentBatch.batch_id}/retry/${index}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(options)
+        });
+        const snapshot = await readResponse(response, '重试失败');
+        applyBatchSnapshot(snapshot);
+        showToast('已重新提交', 'success');
+        const hasActive = snapshot.items.some(item => ACTIVE_TASK_STATUSES.includes(item.status));
+        if (hasActive) scheduleBatchPoll();
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function deleteBatchItem(index) {
+    if (!currentBatch?.batch_id) return;
+    const item = currentBatch.items[index];
+    if (!item) return;
+    if (!confirm(`确定删除"${batchInputLabel(item)}"?`)) return;
+    try {
+        currentBatch.items.splice(index, 1);
+        if (!currentBatch.items.length) {
+            currentBatch = null;
+            sessionStorage.removeItem('lastBatchId');
+        }
+        renderBatch();
+        showToast('已删除', 'success');
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+// ========== 批量处理函数结束 ==========
+
 
 function showStoppedTask(task) {
     stopElapsedTimer(task.elapsed_seconds);
@@ -2815,3 +3056,211 @@ function showToast(message, type = 'info') {
     byId('toastRegion').appendChild(toast);
     window.setTimeout(() => toast.remove(), 4200);
 }
+
+// ========================================
+// 批量处理功能
+// ========================================
+
+let batchPollingTimer = null;
+
+async function startBatch() {
+    const textarea = byId('batchInput');
+    if (!textarea) return;
+
+    const lines = textarea.value.split('\n').map(line => line.trim()).filter(line => line);
+    if (lines.length === 0) {
+        showToast('请输入至少一个视频链接', 'warning');
+        return;
+    }
+
+    const profile = getSelectedProfile();
+    if (!profile) {
+        showToast('请先选择模型档案', 'warning');
+        return;
+    }
+
+    const keyValue = await getApiKeyForProfile(profile);
+    if (!keyValue) {
+        showToast('未找到该档案的 API Key，请先保存', 'warning');
+        return;
+    }
+
+    const payload = {
+        urls: lines,
+        llm_profile: profile.value,
+        api_key: keyValue,
+        whisper_model: byId('whisperModel')?.value || 'large-v3',
+        format: byId('formatSelect')?.value || 'markdown',
+        language: byId('languageCode')?.value || 'zh',
+        output_mode: byId('outputSegmented')?.checked ? 'segmented' : 'full',
+        temperature: parseFloat(byId('temperature')?.value || 0),
+        speaker_label: byId('speakerLabel')?.checked || false
+    };
+
+    try {
+        const response = await fetch('/api/batches', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errMsg = await extractErrorMessage(response, '启动批量处理失败');
+            showToast(errMsg, 'error');
+            return;
+        }
+
+        const data = await response.json();
+        showToast(`已添加 ${data.total} 个任务到批量队列`, 'success');
+        textarea.value = '';
+
+        // 立即刷新一次，然后开启定时轮询
+        await refreshBatch();
+        startBatchPolling();
+
+    } catch (error) {
+        console.error('[批量处理] 启动失败:', error);
+        showToast('启动批量处理失败：' + error.message, 'error');
+    }
+}
+
+async function refreshBatch(showMessage = false) {
+    try {
+        const response = await fetch('/api/batches');
+        if (!response.ok) {
+            const errMsg = await extractErrorMessage(response, '获取批量状态失败');
+            if (showMessage) showToast(errMsg, 'error');
+            return;
+        }
+
+        const data = await response.json();
+        renderBatchItems(data.items || []);
+
+        // 如果有进行中的任务，继续轮询；否则停止
+        const hasRunning = data.items.some(item =>
+            item.status === 'pending' || item.status === 'processing'
+        );
+
+        if (hasRunning) {
+            startBatchPolling();
+        } else {
+            stopBatchPolling();
+        }
+
+        if (showMessage) {
+            showToast('已刷新批量处理状态', 'success');
+        }
+
+    } catch (error) {
+        console.error('[批量处理] 刷新失败:', error);
+        if (showMessage) {
+            showToast('刷新批量处理状态失败：' + error.message, 'error');
+        }
+    }
+}
+
+function renderBatchItems(items) {
+    const container = byId('batchItemList');
+    if (!container) return;
+
+    if (items.length === 0) {
+        container.innerHTML = '<div class="batch-empty">暂无批量任务</div>';
+        return;
+    }
+
+    container.innerHTML = items.map(item => {
+        const statusClass = item.status === 'completed' ? 'success'
+            : item.status === 'failed' ? 'error'
+            : item.status === 'processing' ? 'processing'
+            : 'pending';
+
+        const statusText = item.status === 'completed' ? '完成'
+            : item.status === 'failed' ? '失败'
+            : item.status === 'processing' ? '处理中'
+            : '等待中';
+
+        const retryBtn = item.status === 'failed'
+            ? `<button class="batch-retry-btn" data-batch-id="${item.batch_id}" data-item-index="${item.index}">重试</button>`
+            : '';
+
+        const openBtn = item.status === 'completed' && item.task_id
+            ? `<button class="batch-open-btn" data-task-id="${item.task_id}">查看</button>`
+            : '';
+
+        return `
+            <div class="batch-item ${statusClass}">
+                <div class="batch-item-header">
+                    <span class="batch-item-status">${statusText}</span>
+                    <span class="batch-item-url" title="${item.url}">${truncateUrl(item.url)}</span>
+                </div>
+                ${item.error ? `<div class="batch-item-error">${item.error}</div>` : ''}
+                ${retryBtn || openBtn ? `<div class="batch-item-actions">${retryBtn}${openBtn}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+}
+
+function truncateUrl(url, maxLen = 50) {
+    if (url.length <= maxLen) return url;
+    return url.substring(0, maxLen - 3) + '...';
+}
+
+function handleBatchAction(event) {
+    const retryBtn = event.target.closest('.batch-retry-btn');
+    if (retryBtn) {
+        const batchId = retryBtn.dataset.batchId;
+        const itemIndex = parseInt(retryBtn.dataset.itemIndex, 10);
+        retryBatchItem(batchId, itemIndex);
+        return;
+    }
+
+    const openBtn = event.target.closest('.batch-open-btn');
+    if (openBtn) {
+        const taskId = openBtn.dataset.taskId;
+        openRecentTask(taskId);
+        return;
+    }
+}
+
+async function retryBatchItem(batchId, itemIndex) {
+    try {
+        const response = await fetch(`/api/batches/${batchId}/retry/${itemIndex}`, {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const errMsg = await extractErrorMessage(response, '重试失败');
+            showToast(errMsg, 'error');
+            return;
+        }
+
+        showToast('已重新提交任务', 'success');
+        await refreshBatch();
+        startBatchPolling();
+
+    } catch (error) {
+        console.error('[批量处理] 重试失败:', error);
+        showToast('重试失败：' + error.message, 'error');
+    }
+}
+
+function startBatchPolling() {
+    if (batchPollingTimer) return; // 已经在轮询中
+
+    batchPollingTimer = window.setInterval(() => {
+        refreshBatch(false);
+    }, 5000); // 每5秒轮询一次
+}
+
+function stopBatchPolling() {
+    if (batchPollingTimer) {
+        window.clearInterval(batchPollingTimer);
+        batchPollingTimer = null;
+    }
+}
+
+// 页面加载时刷新一次批量状态
+window.addEventListener('DOMContentLoaded', () => {
+    refreshBatch(false);
+});
+

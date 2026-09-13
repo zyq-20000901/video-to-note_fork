@@ -273,6 +273,18 @@
             </div>
         </section>
 
+        <section id="batchPanel" class="batch-panel" aria-labelledby="batchTitle" hidden>
+            <div class="section-heading recent-heading">
+                <div>
+                    <h3 id="batchTitle">本次批次</h3>
+                    <p id="batchSummary" class="batch-summary" aria-live="polite"></p>
+                </div>
+                <button id="refreshBatchBtn" class="button ghost compact-button" type="button">刷新</button>
+            </div>
+            <p id="batchNetworkState" class="batch-network-state" role="status"></p>
+            <ol id="batchItemList" class="batch-item-list"></ol>
+        </section>
+
         <section id="recentTasksPanel" class="recent-panel" aria-labelledby="recentTasksTitle" hidden>
             <div class="section-heading recent-heading">
                 <div>

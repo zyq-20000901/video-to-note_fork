@@ -12,10 +12,11 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiofiles
 import uvicorn
@@ -39,9 +40,10 @@ class NoCacheStaticFiles(StaticFiles):
         else:
             response.headers["Cache-Control"] = "no-cache"
         return response
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, StrictStr, ValidationError
 
 from . import secret_box
+from .batch_store import BatchStore
 from .config_store import BiliCredentialsUnavailable, LLM_KEYS_FILE, ConfigStore
 from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
@@ -49,6 +51,7 @@ from .llm_summarizer import (
     default_base_url,
     normalize_endpoint_host,
 )
+from .media_worker import run_media_call
 from .bili_login import BiliLoginManager
 from .douyin_login import DouyinLoginManager
 from .transcript import (
@@ -83,11 +86,11 @@ FAVICON_PATH = BASE_DIR / "sources" / "icon.ico"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "2048"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # 超过该体积的本地视频上传后自动提取音频（16kHz m4a）并删除原视频，
-# 保留与在线视频一致的轻量工作目录；勾选“视频截图”时保留原视频。
-LARGE_UPLOAD_EXTRACT_MB = int(os.getenv("LARGE_UPLOAD_EXTRACT_MB", "300"))
+# 保留与在线视频一致的轻量工作目录；勾选”视频截图”时保留原视频。
+LARGE_UPLOAD_EXTRACT_MB = int(os.getenv(“LARGE_UPLOAD_EXTRACT_MB”, “300”))
 LARGE_UPLOAD_EXTRACT_BYTES = LARGE_UPLOAD_EXTRACT_MB * 1024 * 1024
-MAX_CONCURRENT_TASKS = max(1, int(os.getenv("MAX_CONCURRENT_TASKS", "1")))
-TASK_HISTORY_LIMIT = max(10, int(os.getenv("TASK_HISTORY_LIMIT", "100")))
+MAX_CONCURRENT_SUMMARIES = max(1, int(os.getenv(“MAX_CONCURRENT_SUMMARIES”, “3”)))
+TASK_HISTORY_LIMIT = max(10, int(os.getenv(“TASK_HISTORY_LIMIT”, “100”)))
 ALLOWED_MEDIA_SUFFIXES = {
     ".mp3",
     ".m4a",
@@ -252,9 +255,10 @@ def transcribe_progress_reporter(
 bili_login_manager = BiliLoginManager(WORKSPACE_DIR)
 douyin_login_manager = DouyinLoginManager(WORKSPACE_DIR)
 config_store = ConfigStore(WORKSPACE_DIR)
+batch_store = BatchStore(WORKSPACE_DIR)
 tasks: dict[str, dict[str, Any]] = {}
 running_jobs: dict[str, asyncio.Task[None]] = {}
-task_slots = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+summary_slots = asyncio.Semaphore(MAX_CONCURRENT_SUMMARIES)
 
 
 class BilibiliCookie(BaseModel):
@@ -357,6 +361,17 @@ class BiliPagesRequest(BaseModel):
 
     video_url: str
     bilibili_cookie: BilibiliCookie | None = None
+
+
+class BatchSource(BaseModel):
+    video_url: StrictStr = ""
+    upload_task_id: StrictStr | None = None
+
+
+class BatchRequest(BaseModel):
+    # 每项单独校验，避免一条错误链接使其他输入全部失效。
+    items: list[Any] = Field(min_length=1, max_length=100)
+    config: SummarizeRequest
 
 
 def new_task(status: str = "pending", task_id: str | None = None) -> dict[str, Any]:
@@ -1282,7 +1297,7 @@ async def upload_video(
     ):
         audio_path = task_dir / "input.m4a"
         try:
-            extracted = await asyncio.to_thread(
+            extracted = await run_media_call(
                 video_processor.extract_audio_track, file_path, audio_path
             )
         except Exception:
@@ -1397,6 +1412,122 @@ async def delete_task(task_id: str) -> dict[str, bool]:
     await video_processor.cleanup(task_id)
     tasks.pop(task_id, None)
     return {"deleted": True}
+
+
+@app.post("/api/batches")
+async def submit_batch(request: BatchRequest) -> dict[str, Any]:
+    """批量提交：前端已校验 URL 或 upload_task_id，后端对每项再做次正式验证。"""
+    # 约定：所有登录 cookie / API key 通过 config 提交
+    sources: list[dict[str, Any]] = []
+    for i, raw_item in enumerate(request.items, start=1):
+        try:
+            src = BatchSource.model_validate(raw_item)
+        except ValidationError as ve:
+            sources.append({"index": i, "error": str(ve)})
+            continue
+        if not src.video_url and not src.upload_task_id:
+            sources.append({"index": i, "error": "需提供 video_url 或 upload_task_id"})
+            continue
+        sources.append({"index": i, "video_url": src.video_url, "upload_task_id": src.upload_task_id})
+
+    # 创建批次任务
+    batch_id = f"batch_{int(time.time() * 1000)}"
+    batch_store.create(batch_id, sources, request.config.model_dump())
+    for item in sources:
+        if "error" in item:
+            batch_store.mark_item_failed(batch_id, item["index"], item["error"])
+            continue
+        try:
+            # 调用现有 start_summarize 并指定 batch_id / item_index
+            vid_url = item.get("video_url", "")
+            upload_tid = item.get("upload_task_id")
+            req = SummarizeRequest(
+                video_url=vid_url,
+                upload_task_id=upload_tid,
+                **request.config.model_dump(exclude={"video_url", "upload_task_id"}),
+            )
+            result = await start_summarize(req, batch_id=batch_id, batch_index=item["index"])
+            batch_store.bind_item_task(batch_id, item["index"], result["task_id"] or "")
+        except Exception as e:
+            batch_store.mark_item_failed(batch_id, item["index"], str(e))
+
+    return {"batch_id": batch_id, "items_count": len(sources)}
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch_status(batch_id: str) -> dict[str, Any]:
+    """返回批次整体状态 + 每项子任务的状态。"""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    # 合并子任务的实时状态
+    for item in batch["items"]:
+        tid = item.get("task_id")
+        if tid and tid in tasks:
+            sub = tasks[tid]
+            item["status"] = sub["status"]
+            item["progress"] = sub["progress"]
+            item["step_name"] = sub.get("step_name", "")
+            item["error"] = sub.get("error")
+    batch_store.update(batch_id, batch)  # 持久化最新状态
+    return batch
+
+
+@app.delete("/api/batches/{batch_id}")
+async def delete_batch(batch_id: str) -> dict[str, bool]:
+    """删除批次记录并清理子任务。"""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    for item in batch["items"]:
+        tid = item.get("task_id")
+        if tid and tid in tasks:
+            try:
+                await delete_task(tid)
+            except Exception:
+                pass
+    batch_store.delete(batch_id)
+    return {"deleted": True}
+
+
+@app.post("/api/batches/{batch_id}/retry")
+async def retry_batch_item(batch_id: str, task_id: str = Body(..., embed=True)):
+    """重试批次中的单个失败任务"""
+    batch = batch_store.get(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    # 找到对应的任务
+    task_idx = next((i for i, t in enumerate(batch["tasks"]) if t["task_id"] == task_id), None)
+    if task_idx is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task_info = batch["tasks"][task_idx]
+    if task_info["status"] not in ["failed", "error"]:
+        raise HTTPException(status_code=400, detail="只能重试失败的任务")
+
+    # 重新创建任务：直接调用 submit_batch 的逻辑
+    source = task_info.get("source", {})
+
+    # 构造单个项目的批次请求
+    retry_request = BatchRequest(items=[source])
+    result = await submit_batch(retry_request)
+
+    # 获取新创建的任务ID
+    new_task_id = result["batch_id"]
+    new_batch = batch_store.get(new_task_id)
+    if new_batch and new_batch["tasks"]:
+        new_task_id = new_batch["tasks"][0]["task_id"]
+
+    # 更新原批次中的任务记录
+    batch["tasks"][task_idx] = {
+        "task_id": new_task_id,
+        "status": "pending",
+        "source": source,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    return {"task_id": new_task_id}
 
 
 def _format_page_nums(pages) -> str:
